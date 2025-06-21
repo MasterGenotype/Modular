@@ -1,0 +1,17 @@
+# Node modules
+node_modules/
+
+# Build directories
+build/
+
+
+# Logs
+*.log
+
+# Environment files
+.env
+
+# executables
+bin/
+
+
