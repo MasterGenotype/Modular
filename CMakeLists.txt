@@ -30,6 +30,7 @@ set(SOURCES
     src/GameBanana.cpp
     src/Rename.cpp
     src/main.cpp
+    src/Config.cpp
 )
 
 # Create a library for all the sources

@@ -1,4 +1,0 @@
-/home/superphenotype/.projects/Modular/CMakeFiles/ModularLib.dir
-/home/superphenotype/.projects/Modular/CMakeFiles/Modular_Linux.dir
-/home/superphenotype/.projects/Modular/CMakeFiles/edit_cache.dir
-/home/superphenotype/.projects/Modular/CMakeFiles/rebuild_cache.dir
