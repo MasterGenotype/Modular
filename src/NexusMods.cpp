@@ -3,6 +3,11 @@
 #include <cstdlib>
 #include <curl/curl.h>
 #include <thread>
+#include <mutex>
+#include <queue>
+#include <atomic>
+
+static std::mutex console_mutex;
 
 //----------------------------------------------------------------------------------
 // Curl utility functions
@@ -269,6 +274,131 @@ void save_download_links(const std::map<std::pair<int, int>, std::string>& downl
 }
 
 /**
+ * The actual download logic for a single file, with retries.
+ * This function is thread-safe.
+ */
+static void download_file_with_retries(const std::string& url_in, const fs::path& file_path,
+                                     int mod_id, int file_id) {
+    const int retries = 5;
+    // Escape only spaces in the URL
+    std::string safe_url = escape_spaces(url_in);
+
+    for (int attempt = 0; attempt < retries; attempt++) {
+        {
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cout << "Downloading Mod ID " << mod_id << ", File ID "
+                      << file_id << " (Attempt " << (attempt + 1) << "/" << retries << ")..." << std::endl;
+        }
+
+        CURL* curl = curl_easy_init();
+        if (!curl) {
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cerr << "Failed to initialize CURL for download." << std::endl;
+            return;
+        }
+
+        FILE* fp = std::fopen(file_path.string().c_str(), "wb");
+        if (!fp) {
+            {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cerr << "Failed to open file for writing: "
+                          << file_path.string() << std::endl;
+            }
+            curl_easy_cleanup(curl);
+            return;
+        }
+
+        // Set the (space-escaped) URL
+        curl_easy_setopt(curl, CURLOPT_URL, safe_url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, nullptr);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+        // Perform the request
+        CURLcode res = curl_easy_perform(curl);
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+        std::fclose(fp);
+        curl_easy_cleanup(curl);
+
+        if (res == CURLE_OK && http_code == 200) {
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cout << "Downloaded " << file_path.filename().string()
+                      << " to " << file_path.parent_path().string() << std::endl;
+            return; // success
+        } else {
+            {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cerr << "Error downloading Mod ID " << mod_id << ", File ID "
+                          << file_id << ": CURL code " << res
+                          << ", HTTP code " << http_code << std::endl;
+            }
+            if (attempt < retries - 1) {
+                {
+                    std::lock_guard<std::mutex> lock(console_mutex);
+                    std::cout << "Retrying in 5 seconds..." << std::endl;
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+            } else {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cerr << "Failed to download Mod ID " << mod_id
+                          << ", File ID " << file_id << " after " << retries
+                          << " attempts." << std::endl;
+            }
+        }
+    }
+}
+
+namespace {
+
+struct DownloadTask {
+    std::string url;
+    fs::path file_path;
+    int mod_id;
+    int file_id;
+};
+
+template <typename T>
+class ThreadSafeQueue {
+public:
+    void push(T value) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_queue.push(std::move(value));
+    }
+
+    bool try_pop(T& value) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_queue.empty()) {
+            return false;
+        }
+        value = std::move(m_queue.front());
+        m_queue.pop();
+        return true;
+    }
+
+private:
+    std::queue<T> m_queue;
+    mutable std::mutex m_mutex;
+};
+
+void download_worker(ThreadSafeQueue<DownloadTask>& queue, std::atomic<int>& progress_counter, int total_files) {
+    DownloadTask task;
+    while (queue.try_pop(task)) {
+        download_file_with_retries(task.url, task.file_path, task.mod_id, task.file_id);
+        int completed = ++progress_counter;
+        {
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cout << "Progress: [" << completed << "/" << total_files << "] files downloaded." << std::endl;
+        }
+    }
+}
+
+} // anonymous namespace
+
+/**
  * Download files from the list of URLs in download_links.txt with retry logic.
  */
 void download_files(const std::string& game_domain, const fs::path& base_dir)
@@ -277,83 +407,30 @@ void download_files(const std::string& game_domain, const fs::path& base_dir)
     fs::path download_links_path = base_directory / "download_links.txt";
 
     if (!fs::exists(download_links_path)) {
-        std::cout << "download_links.txt file not found." << std::endl;
+        std::lock_guard<std::mutex> lock(console_mutex);
+        std::cout << "download_links.txt file not found in " << download_links_path.parent_path() << std::endl;
         return;
     }
 
     // Read lines
     std::ifstream ifs(download_links_path.string());
     std::vector<std::string> lines;
-    {
-        std::string line;
-        while (std::getline(ifs, line)) {
-            if (!line.empty()) {
-                lines.push_back(line);
-            }
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (!line.empty()) {
+            lines.push_back(line);
         }
     }
 
-    // Utility function to download a file with retries
-    auto download_with_retries = [&](const std::string& url_in, const fs::path& file_path,
-                                     int mod_id, int file_id) {
-        const int retries = 5;
-        // Escape only spaces in the URL
-        std::string safe_url = escape_spaces(url_in);
+    if (lines.empty()) {
+        std::lock_guard<std::mutex> lock(console_mutex);
+        std::cout << "No download links found in " << download_links_path << std::endl;
+        return;
+    }
 
-        for (int attempt = 0; attempt < retries; attempt++) {
-            std::cout << "Downloading Mod ID " << mod_id << ", File ID "
-                      << file_id << " (Attempt " << (attempt + 1) << ")..." << std::endl;
+    ThreadSafeQueue<DownloadTask> download_queue;
 
-            CURL* curl = curl_easy_init();
-            if (!curl) {
-                std::cerr << "Failed to initialize CURL for download." << std::endl;
-                return;
-            }
-
-            FILE* fp = std::fopen(file_path.string().c_str(), "wb");
-            if (!fp) {
-                std::cerr << "Failed to open file for writing: "
-                          << file_path.string() << std::endl;
-                curl_easy_cleanup(curl);
-                return;
-            }
-
-            // Set the (space-escaped) URL
-            curl_easy_setopt(curl, CURLOPT_URL, safe_url.c_str());
-            curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, nullptr);
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-            // Perform the request
-            CURLcode res = curl_easy_perform(curl);
-            long http_code = 0;
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-            std::fclose(fp);
-            curl_easy_cleanup(curl);
-
-            if (res == CURLE_OK && http_code == 200) {
-                std::cout << "Downloaded " << file_path.filename().string()
-                          << " to " << file_path.parent_path().string() << std::endl;
-                return; // success
-            } else {
-                std::cerr << "Error downloading Mod ID " << mod_id << ", File ID "
-                          << file_id << ": CURL code " << res
-                          << ", HTTP code " << http_code << std::endl;
-                if (attempt < retries - 1) {
-                    std::cout << "Retrying..." << std::endl;
-                    std::this_thread::sleep_for(std::chrono::seconds(5));
-                } else {
-                    std::cerr << "Failed to download Mod ID " << mod_id
-                              << ", File ID " << file_id << " after " << retries
-                              << " attempts." << std::endl;
-                }
-            }
-        }
-    };
-
-    // Process each line
+    // Process each line and populate the download queue
     for (auto& line : lines) {
         std::stringstream ss(line);
         std::string mod_id_str, file_id_str, url;
@@ -361,8 +438,6 @@ void download_files(const std::string& game_domain, const fs::path& base_dir)
             int mod_id = std::stoi(mod_id_str);
             int file_id = std::stoi(file_id_str);
 
-            // Get filename from URL
-            // e.g. ... /filename.ext?some=param
             std::string filename;
             {
                 // Extract substring after last '/'
@@ -390,11 +465,27 @@ void download_files(const std::string& game_domain, const fs::path& base_dir)
             // Define the full path
             fs::path file_path = mod_directory / filename;
 
-            // Download with retry
-            download_with_retries(url, file_path, mod_id, file_id);
-
-            // Optional: Sleep to respect server load
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            download_queue.push({url, file_path, mod_id, file_id});
         }
     }
+
+    const int num_threads = 4;
+    std::vector<std::thread> threads;
+    std::atomic<int> progress_counter(0);
+    int total_files = lines.size();
+
+    {
+        std::lock_guard<std::mutex> lock(console_mutex);
+        std::cout << "Starting download of " << total_files << " files using " << num_threads << " concurrent workers..." << std::endl;
+    }
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(download_worker, std::ref(download_queue), std::ref(progress_counter), total_files);
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    std::cout << "All downloads have been processed." << std::endl;
 }
