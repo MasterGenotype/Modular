@@ -5,19 +5,6 @@
 #include <utility>
 #include <vector>
 
-// Initializes necessary resources (e.g., cURL).
-void initialize();
-
-// Cleans up resources (e.g., cURL).
-void cleanup();
-
-// Performs an HTTP GET request to the specified URL and returns the response as a string.
-std::string httpGet(const std::string& url);
-
-// Downloads a file from the specified URL and saves it to the given output path.
-// Returns true if the download succeeds, false otherwise.
-bool downloadFile(const std::string& url, const std::string& outputPath);
-
 // Sanitizes a filename by replacing illegal characters with underscores.
 std::string sanitizeFilename(const std::string& name);
 

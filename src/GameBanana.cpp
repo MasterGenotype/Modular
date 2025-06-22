@@ -1,77 +1,11 @@
 #include "GameBanana.h"
+#include "HTTPClient.h"
 #include "nlohmann/json.hpp"
-#include <curl/curl.h>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <sstream>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
-
-static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp)
-{
-    size_t totalSize = size * nmemb;
-    std::string* str = static_cast<std::string*>(userp);
-    str->append(static_cast<char*>(contents), totalSize);
-    return totalSize;
-}
-
-void initialize()
-{
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-}
-
-void cleanup()
-{
-    curl_global_cleanup();
-}
-
-std::string httpGet(const std::string& url)
-{
-    CURL* curl = curl_easy_init();
-    std::string response;
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        CURLcode res = curl_easy_perform(curl);
-        if (res != CURLE_OK) {
-            std::cerr << "Error: curl_easy_perform() failed for URL " << url << "\n"
-                      << "       " << curl_easy_strerror(res) << std::endl;
-        }
-        curl_easy_cleanup(curl);
-    }
-    return response;
-}
-
-size_t WriteFileCallback(void* ptr, size_t size, size_t nmemb, void* stream)
-{
-    return fwrite(ptr, size, nmemb, (FILE*)stream);
-}
-
-bool downloadFile(const std::string& url, const std::string& outputPath)
-{
-    CURL* curl = curl_easy_init();
-    if (curl) {
-        FILE* fp = fopen(outputPath.c_str(), "wb");
-        if (!fp) {
-            std::cerr << "Error: Could not open file " << outputPath << " for writing." << std::endl;
-            curl_easy_cleanup(curl);
-            return false;
-        }
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteFileCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-        CURLcode res = curl_easy_perform(curl);
-        fclose(fp);
-        curl_easy_cleanup(curl);
-        return res == CURLE_OK;
-    }
-    return false;
-}
 
 std::string sanitizeFilename(const std::string& name)
 {
@@ -100,11 +34,11 @@ std::string extractFileName(const std::string& downloadUrl)
 std::vector<std::pair<std::string, std::string>> fetchSubscribedMods(const std::string& userId)
 {
     std::string url = "https://gamebanana.com/apiv11/Member/" + userId + "/Subscriptions";
-    std::string response = httpGet(url);
+    HTTPClient::HttpResponse response = HTTPClient::http_get(url);
     std::vector<std::pair<std::string, std::string>> mods;
-    if (response.empty())
+    if (response.status_code != 200 || response.body.empty())
         return mods;
-    json subsJson = json::parse(response);
+    json subsJson = json::parse(response.body);
     if (!subsJson.contains("_aRecords"))
         return mods;
     for (const auto& record : subsJson["_aRecords"]) {
@@ -122,11 +56,11 @@ std::vector<std::pair<std::string, std::string>> fetchSubscribedMods(const std::
 std::vector<std::string> fetchModFileUrls(const std::string& modId)
 {
     std::string url = "https://gamebanana.com/apiv11/Mod/" + modId + "?_csvProperties=_aFiles";
-    std::string response = httpGet(url);
+    HTTPClient::HttpResponse response = HTTPClient::http_get(url);
     std::vector<std::string> urls;
-    if (response.empty())
+    if (response.status_code != 200 || response.body.empty())
         return urls;
-    json fileListJson = json::parse(response);
+    json fileListJson = json::parse(response.body);
     if (!fileListJson.contains("_aFiles"))
         return urls;
     for (const auto& fileEntry : fileListJson["_aFiles"]) {
@@ -145,6 +79,6 @@ void downloadModFiles(const std::string& modId, const std::string& modName, cons
     int fileCount = 0;
     for (const auto& url : downloadUrls) {
         std::string outputPath = modFolder + "/" + std::to_string(++fileCount) + "_" + extractFileName(url);
-        downloadFile(url, outputPath);
+        HTTPClient::download_file(url, outputPath);
     }
 }

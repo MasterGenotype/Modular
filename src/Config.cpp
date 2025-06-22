@@ -13,8 +13,7 @@ namespace { // Anonymous namespace for internal linkage
 fs::path get_config_dir() {
     const char* homeEnv = std::getenv("HOME");
     if (!homeEnv) {
-        std::cerr << "Error: HOME environment variable not set. Cannot determine config directory." << std::endl;
-        exit(EXIT_FAILURE);
+        throw std::runtime_error("FATAL: HOME environment variable not set. Cannot determine config directory.");
     }
     return fs::path(homeEnv) / ".config" / "Modular";
 }
@@ -40,7 +39,9 @@ std::optional<AppConfig> load_config() {
         AppConfig config;
         config.mods_directory = data.at("mods_directory").get<std::string>();
         config.nexus_api_key = data.at("nexus_api_key").get<std::string>();
-        config.gb_user_id = data.value("gb_user_id", ""); // GameBanana ID is optional
+        config.gb_user_id = data.value("gb_user_id", "");                 // GameBanana ID is optional
+        config.nexus_cookie_path = data.value("nexus_cookie_path", ""); // Scraper cookie path is optional
+        // executable_path is a runtime property, not stored in the file.
         return config;
     } catch (const json::exception& e) {
         std::cerr << "Error parsing config file: " << e.what() << std::endl;
@@ -62,7 +63,8 @@ bool save_config(const AppConfig& config) {
     json data = {
         {"mods_directory", config.mods_directory},
         {"nexus_api_key", config.nexus_api_key},
-        {"gb_user_id", config.gb_user_id}};
+        {"gb_user_id", config.gb_user_id},
+        {"nexus_cookie_path", config.nexus_cookie_path}};
 
     std::ofstream o(config_path);
     if (!o.is_open()) {
@@ -74,7 +76,7 @@ bool save_config(const AppConfig& config) {
     return true;
 }
 
-AppConfig run_initial_setup() {
+std::optional<AppConfig> run_initial_setup() {
     AppConfig config;
     std::cout << "--- First Time Setup ---\n";
     std::cout << "It looks like this is your first time running Modular, or the config file is missing.\n";
@@ -110,20 +112,27 @@ AppConfig run_initial_setup() {
     std::cout << "\nPlease enter your GameBanana User ID (optional, can be left blank):\n> ";
     std::getline(std::cin, config.gb_user_id);
 
+    // 4. NexusMods Cookie Path
+    std::cout << "\nPlease enter the full path to your NexusMods cookies.json file (for the backup scraper).\n";
+    std::cout << "This is optional and can be left blank. You can get this file from your browser using an extension.\n> ";
+    std::getline(std::cin, config.nexus_cookie_path);
+
     if (save_config(config)) {
         std::cout << "\nConfiguration saved successfully to " << get_config_file_path() << "\n";
     } else {
-        std::cerr << "\nFATAL: Failed to save configuration. Exiting.\n";
-        exit(EXIT_FAILURE);
+        std::cerr << "\nFATAL: Failed to save configuration.\n";
+        return std::nullopt;
     }
 
     std::cout << "--- Setup Complete ---\n\n";
-    return config;
+    return {config};
 }
 
 } // end anonymous namespace
 
-AppConfig initialize_app() {
+std::optional<AppConfig> initialize_app(const fs::path& exec_path) {
     auto config_opt = load_config();
-    return config_opt.has_value() ? *config_opt : run_initial_setup();
+    auto final_config = config_opt.has_value() ? config_opt : run_initial_setup();
+    if (final_config) final_config->executable_path = exec_path;
+    return final_config;
 }

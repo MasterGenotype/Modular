@@ -1,86 +1,51 @@
 #include "Rename.h"
-#include <curl/curl.h>
+#include "HTTPClient.h"
 #include <iostream>
 #include <nlohmann/json.hpp>
-#include "NexusMods.h" // For API_KEY
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-// This callback will be used by libcurl to write received data into a std::string.
-size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp)
-{
-    std::string* str = static_cast<std::string*>(userp);
-    size_t totalSize = size * nmemb;
-    str->append(static_cast<char*>(contents), totalSize);
-    return totalSize;
+namespace { // Anonymous namespace for internal helper function
+std::vector<std::string> getSubdirectoryNames(const fs::path& directory) {
+    std::vector<std::string> names;
+    if (!fs::exists(directory)) {
+        std::cerr << "Directory does not exist: " << directory << std::endl;
+        return names;
+    }
+    for (const auto& entry : fs::directory_iterator(directory)) {
+        if (entry.is_directory()) {
+            names.push_back(entry.path().filename().string());
+        }
+    }
+    return names;
 }
+} // end anonymous namespace
 
 std::vector<std::string> getGameDomainNames(const fs::path& modsListsDir)
 {
-    std::vector<std::string> domains;
-
-    if (!fs::exists(modsListsDir)) {
-        std::cerr << "Directory does not exist: " << modsListsDir << std::endl;
-        return domains;
-    }
-
-    for (const auto& entry : fs::directory_iterator(modsListsDir)) {
-        if (entry.is_directory()) {
-            domains.push_back(entry.path().filename().string());
-        }
-    }
-    return domains;
+    return getSubdirectoryNames(modsListsDir);
 }
 
 std::vector<std::string> getModIDs(const fs::path& gameDomainPath)
 {
-    std::vector<std::string> modIDs;
-
-    if (!fs::exists(gameDomainPath)) {
-        std::cerr << "Directory does not exist: " << gameDomainPath << std::endl;
-        return modIDs;
-    }
-
-    for (const auto& entry : fs::directory_iterator(gameDomainPath)) {
-        if (entry.is_directory()) {
-            modIDs.push_back(entry.path().filename().string());
-        }
-    }
-    return modIDs;
+    return getSubdirectoryNames(gameDomainPath);
 }
 
-std::string fetchModName(const std::string& gameDomain, const std::string& modID)
+std::string fetchModName(const AppConfig& config, const std::string& gameDomain, const std::string& modID)
 {
-    CURL* curl = curl_easy_init();
-    std::string readBuffer;
+    // Construct the API URL.
+    std::string url = "https://api.nexusmods.com/v1/games/" + gameDomain + "/mods/" + modID;
 
-    if (curl) {
-        // Construct the API URL.
-        std::string url = "https://api.nexusmods.com/v1/games/" + gameDomain + "/mods/" + modID;
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+    // Use the API_KEY from the config object.
+    std::vector<std::string> headers = {"apikey: " + config.nexus_api_key};
 
-        // Use the global API_KEY, which should be set by main().
-
-        // Set the API key as an HTTP header.
-        std::string headerStr = "apikey: " + API_KEY;
-        struct curl_slist* headers = nullptr;
-        headers = curl_slist_append(headers, headerStr.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-        // Perform the API request.
-        CURLcode res = curl_easy_perform(curl);
-        if (res != CURLE_OK) {
-            std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << "\n";
-        }
-
-        // Cleanup.
-        curl_easy_cleanup(curl);
-        curl_slist_free_all(headers);
+    HTTPClient::HttpResponse resp = HTTPClient::http_get(url, headers);
+    if (resp.status_code != 200) {
+        std::cerr << "Failed to fetch mod name for " << modID << ". Status: " << resp.status_code << std::endl;
+        return "";
     }
-    return readBuffer;
+    return resp.body;
 }
 
 std::string extractModName(const std::string& jsonResponse)
@@ -94,22 +59,4 @@ std::string extractModName(const std::string& jsonResponse)
         std::cerr << "JSON parse error: " << e.what() << std::endl;
     }
     return "";
-}
-
-void combineDirectories(const fs::path& target, const fs::path& source)
-{
-    if (!fs::exists(target)) {
-        fs::create_directories(target);
-    }
-    // Iterate over every item in the source directory.
-    for (const auto& entry : fs::directory_iterator(source)) {
-        fs::path dest = target / entry.path().filename();
-        if (entry.is_directory()) {
-            // Recursively merge subdirectories.
-            combineDirectories(dest, entry.path());
-        } else {
-            // Copy (or overwrite) the file.
-            fs::copy(entry.path(), dest, fs::copy_options::overwrite_existing);
-        }
-    }
 }

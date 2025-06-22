@@ -1,55 +1,67 @@
-cmake_minimum_required(VERSION 3.10)
-project(ModularProject)
+# Set the minimum required version of CMake.
+cmake_minimum_required(VERSION 3.16)
 
-# Use C++17
+# Set the project name, version, and language.
+project(Modular VERSION 1.0 LANGUAGES CXX)
+
+# Set the C++ standard to C++17, which is required for std::filesystem.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Set output directories
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build)
+#=============================================================================
+# 1. Find and Configure Dependencies
+#=============================================================================
 
-# Include directories (assuming Rename.h is in the 'include/' directory)
-include_directories(${CMAKE_SOURCE_DIR}/include)
+# --- Fetch nlohmann/json using FetchContent ---
+# This automates downloading the library, removing the need for manual installation.
+include(FetchContent)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.2 # Using a specific, stable version is best practice
+)
+FetchContent_MakeAvailable(nlohmann_json)
 
-# Find cURL
+# --- Find CURL library ---
 find_package(CURL REQUIRED)
 
-# Find nlohmann/json (header-only library)
-find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp)
-if(NLOHMANN_JSON_INCLUDE_DIR)
-    include_directories(${NLOHMANN_JSON_INCLUDE_DIR})
-else()
-    message(FATAL_ERROR "nlohmann/json.hpp not found. Install nlohmann-json or provide the correct include path.")
-endif()
+# --- Find Python Interpreter for the backup scraper ---
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-# Add source files (adjust paths if needed)
-set(SOURCES
+#=============================================================================
+# 2. Define Executable and Link Libraries
+#=============================================================================
+
+# Define the executable target from your source files.
+add_executable(Modular
+    src/main.cpp
     src/NexusMods.cpp
     src/GameBanana.cpp
     src/Rename.cpp
-    src/main.cpp
-    src/Config.cpp
 )
 
-# Create a library for all the sources
-add_library(ModularLib ${SOURCES})
-target_link_libraries(ModularLib CURL::libcurl)
+# Add the 'include' directory to the target's include paths.
+target_include_directories(Modular PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# Linux executable
-add_executable(Modular_Linux src/main.cpp)
-target_link_libraries(Modular_Linux ModularLib)
+# Link the required libraries to our executable.
+target_link_libraries(Modular PRIVATE
+    nlohmann_json::nlohmann_json
+    CURL::libcurl
+)
 
-# Enable additional compiler warnings with GCC/Clang
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(Modular_Linux PRIVATE -Wall -Wextra -Wpedantic)
-endif()
+#=============================================================================
+# 3. Install Rules for Deployment
+#=============================================================================
+# This ensures the executable and its script are placed together correctly.
 
-# Cross-compile for Windows (optional)
-if(CMAKE_CROSSCOMPILING OR CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
-    set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)
-    add_executable(Modular_Windows src/main.cpp)
-    target_link_libraries(Modular_Windows ModularLib)
-endif()
+include(GNUInstallDirs)
+
+# Install the executable to the standard binary directory (e.g., /usr/local/bin)
+install(TARGETS Modular
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Install the Python script into a 'scripts' subdirectory relative to the executable.
+install(FILES scripts/nexus_scraper.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR}/scripts
+)

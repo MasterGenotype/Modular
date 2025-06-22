@@ -1,69 +1,14 @@
 #include "NexusMods.h"
+#include "HTTPClient.h"
 #include <chrono>
 #include <cstdlib>
-#include <curl/curl.h>
-#include <thread>
 #include <mutex>
 #include <queue>
 #include <atomic>
+#include <thread>
+#include <functional>
 
 static std::mutex console_mutex;
-
-//----------------------------------------------------------------------------------
-// Curl utility functions
-//----------------------------------------------------------------------------------
-
-/**
- * Write callback for libcurl to accumulate the response body in a std::string.
- */
-static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp)
-{
-    size_t totalSize = size * nmemb;
-    std::string* str = static_cast<std::string*>(userp);
-    str->append(static_cast<char*>(contents), totalSize);
-    return totalSize;
-}
-
-/**
- * Perform a GET request to the specified URL with the specified headers.
- */
-HttpResponse http_get(const std::string& url, const std::vector<std::string>& headers)
-{
-    HttpResponse response { 0, "" };
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        std::cerr << "Failed to initialize CURL." << std::endl;
-        return response;
-    }
-
-    // Build the custom headers
-    struct curl_slist* curl_headers = nullptr;
-    for (const auto& header : headers) {
-        curl_headers = curl_slist_append(curl_headers, header.c_str());
-    }
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-    // Perform the request
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        std::cerr << "CURL GET failed: " << curl_easy_strerror(res) << std::endl;
-    } else {
-        // Get HTTP status code
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status_code);
-    }
-
-    // Cleanup
-    curl_slist_free_all(curl_headers);
-    curl_easy_cleanup(curl);
-
-    return response;
-}
 
 //----------------------------------------------------------------------------------
 // Utility to escape only raw spaces (replace ' ' with "%20") in a URL
@@ -89,17 +34,17 @@ std::string escape_spaces(const std::string& url)
 /**
  * Retrieve the list of tracked mods and extract mod_ids.
  */
-std::vector<int> get_tracked_mods()
+std::vector<int> get_tracked_mods(const AppConfig& config)
 {
     std::vector<int> mod_ids;
 
     std::string url = "https://api.nexusmods.com/v1/user/tracked_mods.json";
     std::vector<std::string> local_headers = {
         "accept: application/json",
-        "apikey: " + API_KEY
+        "apikey: " + config.nexus_api_key
     };
 
-    HttpResponse resp = http_get(url, local_headers);
+    HTTPClient::HttpResponse resp = HTTPClient::http_get(url, local_headers);
     if (resp.status_code == 200) {
         try {
             json data = json::parse(resp.body);
@@ -133,114 +78,152 @@ std::vector<int> get_tracked_mods()
 }
 
 /**
- * Retrieve file_ids for each mod_id.
+ * A generic thread-safe queue for tasks.
  */
-std::map<int, std::vector<int>> get_file_ids(const std::vector<int>& mod_ids, const std::string& game_domain)
+template <typename T>
+class ThreadSafeQueue {
+public:
+    void push(T value) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_queue.push(std::move(value));
+    }
+
+    bool try_pop(T& value) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_queue.empty()) {
+            return false;
+        }
+        value = std::move(m_queue.front());
+        m_queue.pop();
+        return true;
+    }
+
+private:
+    std::queue<T> m_queue;
+    mutable std::mutex m_mutex;
+};
+
+/**
+ * A generic worker for processing tasks from a queue.
+ */
+template <typename Task, typename Result>
+void api_worker(ThreadSafeQueue<Task>& task_queue, ThreadSafeQueue<Result>& result_queue, std::function<Result(Task)> work_function) {
+    Task task;
+    while (task_queue.try_pop(task)) {
+        result_queue.push(work_function(task));
+        // Respect rate limit *after* performing the task
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+/**
+ * Retrieve file_ids for each mod_id in parallel.
+ */
+std::map<int, std::vector<int>> get_file_ids(const AppConfig& config, const std::vector<int>& mod_ids, const std::string& game_domain)
 {
-    std::map<int, std::vector<int>> mod_file_ids;
+    using Task = int; // mod_id
+    using Result = std::pair<int, std::vector<int>>; // mod_id, file_ids
 
-    for (auto mod_id : mod_ids) {
+    ThreadSafeQueue<Task> task_queue;
+    for (int mod_id : mod_ids) {
+        task_queue.push(mod_id);
+    }
+
+    ThreadSafeQueue<Result> result_queue;
+    auto work_function = [&](Task mod_id) -> Result {
         std::ostringstream oss;
-        oss << "https://api.nexusmods.com/v1/games/"
-            << game_domain << "/mods/" << mod_id << "/files.json?category=main";
-        std::string url = oss.str();
-
-        std::vector<std::string> local_headers = {
-            "accept: application/json",
-            "apikey: " + API_KEY
-        };
-
-        HttpResponse resp = http_get(url, local_headers);
+        oss << "https://api.nexusmods.com/v1/games/" << game_domain << "/mods/" << mod_id << "/files.json?category=main";
+        HTTPClient::HttpResponse resp = HTTPClient::http_get(oss.str(), {"accept: application/json", "apikey: " + config.nexus_api_key});
 
         if (resp.status_code == 200) {
             try {
                 json data = json::parse(resp.body);
                 if (data.contains("files")) {
-                    auto file_list = data["files"];
                     std::vector<int> file_ids;
-                    for (auto& file_json : file_list) {
-                        if (file_json.contains("file_id")) {
-                            file_ids.push_back(file_json["file_id"].get<int>());
-                        }
+                    for (auto& file_json : data["files"]) {
+                        if (file_json.contains("file_id")) file_ids.push_back(file_json["file_id"].get<int>());
                     }
-                    mod_file_ids[mod_id] = file_ids;
-                    std::cout << "Mod ID " << mod_id << " has " << file_ids.size() << " files." << std::endl;
-                } else {
-                    std::cout << "No files found for mod " << mod_id << "." << std::endl;
-                    mod_file_ids[mod_id] = {};
+                    return {mod_id, file_ids};
                 }
             } catch (const std::exception& e) {
-                std::cerr << "JSON parse error in get_file_ids: " << e.what() << std::endl;
-                mod_file_ids[mod_id] = {};
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cerr << "JSON parse error for mod " << mod_id << ": " << e.what() << std::endl;
             }
-        } else {
-            std::cout << "Error fetching files for mod " << mod_id << ": " << resp.status_code << std::endl;
-            mod_file_ids[mod_id] = {};
         }
+        return {mod_id, {}}; // Return empty vector on error
+    };
 
-        // Respect rate limit
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+    const unsigned int num_threads = std::min((unsigned int)mod_ids.size(), std::thread::hardware_concurrency());
+    std::vector<std::thread> threads;
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(api_worker<Task, Result>, std::ref(task_queue), std::ref(result_queue), work_function);
     }
 
+    for (auto& t : threads) t.join();
+
+    std::map<int, std::vector<int>> mod_file_ids;
+    Result result;
+    while (result_queue.try_pop(result)) {
+        mod_file_ids[result.first] = result.second;
+    }
     return mod_file_ids;
 }
 
 /**
- * Generate download links for each (mod_id, file_id) pair.
+ * Generate download links for each (mod_id, file_id) pair in parallel.
  */
-std::map<std::pair<int, int>, std::string> generate_download_links(
+std::map<std::pair<int, int>, std::string> generate_download_links(const AppConfig& config,
     const std::map<int, std::vector<int>>& mod_file_ids,
     const std::string& game_domain)
 {
-    std::map<std::pair<int, int>, std::string> download_links;
+    using Task = std::pair<int, int>; // mod_id, file_id
+    using Result = std::pair<Task, std::string>; // {mod_id, file_id}, url
 
-    for (auto& [mod_id, file_ids] : mod_file_ids) {
+    ThreadSafeQueue<Task> task_queue;
+    size_t total_tasks = 0;
+    for (const auto& [mod_id, file_ids] : mod_file_ids) {
         for (auto file_id : file_ids) {
-            std::ostringstream oss;
-            oss << "https://api.nexusmods.com/v1/games/"
-                << game_domain << "/mods/" << mod_id
-                << "/files/" << file_id << "/download_link.json?expires=999999";
-
-            std::string url = oss.str();
-            std::vector<std::string> local_headers = {
-                "accept: application/json",
-                "apikey: " + API_KEY
-            };
-
-            HttpResponse resp = http_get(url, local_headers);
-
-            if (resp.status_code == 200) {
-                try {
-                    json data = json::parse(resp.body);
-                    // Expecting a list of links
-                    if (data.is_array() && !data.empty()) {
-                        if (data[0].contains("URI")) {
-                            std::string download_url = data[0]["URI"].get<std::string>();
-                            download_links[{ mod_id, file_id }] = download_url;
-                            std::cout << "Generated download link for Mod ID "
-                                      << mod_id << ", File ID " << file_id << "." << std::endl;
-                        } else {
-                            std::cout << "No 'URI' field found for Mod ID "
-                                      << mod_id << ", File ID " << file_id << "." << std::endl;
-                        }
-                    } else {
-                        std::cout << "No download links found for Mod ID "
-                                  << mod_id << ", File ID " << file_id << "." << std::endl;
-                    }
-                } catch (const std::exception& e) {
-                    std::cerr << "JSON parse error in generate_download_links: " << e.what() << std::endl;
-                }
-            } else {
-                std::cout << "Error generating download link for Mod ID "
-                          << mod_id << ", File ID " << file_id << ": "
-                          << resp.status_code << std::endl;
-            }
-
-            // Respect rate limit
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            task_queue.push({mod_id, file_id});
+            total_tasks++;
         }
     }
 
+    ThreadSafeQueue<Result> result_queue;
+    auto work_function = [&](Task task) -> Result {
+        auto [mod_id, file_id] = task;
+        std::ostringstream oss;
+        oss << "https://api.nexusmods.com/v1/games/" << game_domain << "/mods/" << mod_id << "/files/" << file_id << "/download_link.json?expires=999999";
+        HTTPClient::HttpResponse resp = HTTPClient::http_get(oss.str(), {"accept: application/json", "apikey: " + config.nexus_api_key});
+
+        if (resp.status_code == 200) {
+            try {
+                json data = json::parse(resp.body);
+                if (data.is_array() && !data.empty() && data[0].contains("URI")) {
+                    return {task, data[0]["URI"].get<std::string>()};
+                }
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lock(console_mutex);
+                std::cerr << "JSON parse error for link " << mod_id << "/" << file_id << ": " << e.what() << std::endl;
+            }
+        }
+        return {task, ""}; // Return empty string on error
+    };
+
+    const unsigned int num_threads = std::min((unsigned int)total_tasks, std::thread::hardware_concurrency());
+    std::vector<std::thread> threads;
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(api_worker<Task, Result>, std::ref(task_queue), std::ref(result_queue), work_function);
+    }
+
+    for (auto& t : threads) t.join();
+
+    std::map<std::pair<int, int>, std::string> download_links;
+    Result result;
+    while (result_queue.try_pop(result)) {
+        if (!result.second.empty()) {
+            download_links[result.first] = result.second;
+        }
+    }
     return download_links;
 }
 
@@ -290,41 +273,8 @@ static void download_file_with_retries(const std::string& url_in, const fs::path
                       << file_id << " (Attempt " << (attempt + 1) << "/" << retries << ")..." << std::endl;
         }
 
-        CURL* curl = curl_easy_init();
-        if (!curl) {
-            std::lock_guard<std::mutex> lock(console_mutex);
-            std::cerr << "Failed to initialize CURL for download." << std::endl;
-            return;
-        }
-
-        FILE* fp = std::fopen(file_path.string().c_str(), "wb");
-        if (!fp) {
-            {
-                std::lock_guard<std::mutex> lock(console_mutex);
-                std::cerr << "Failed to open file for writing: "
-                          << file_path.string() << std::endl;
-            }
-            curl_easy_cleanup(curl);
-            return;
-        }
-
-        // Set the (space-escaped) URL
-        curl_easy_setopt(curl, CURLOPT_URL, safe_url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, nullptr);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-        // Perform the request
-        CURLcode res = curl_easy_perform(curl);
-        long http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-        std::fclose(fp);
-        curl_easy_cleanup(curl);
-
-        if (res == CURLE_OK && http_code == 200) {
+        // Use the consolidated HTTPClient download function
+        if (HTTPClient::download_file(safe_url, file_path)) {
             std::lock_guard<std::mutex> lock(console_mutex);
             std::cout << "Downloaded " << file_path.filename().string()
                       << " to " << file_path.parent_path().string() << std::endl;
@@ -332,9 +282,7 @@ static void download_file_with_retries(const std::string& url_in, const fs::path
         } else {
             {
                 std::lock_guard<std::mutex> lock(console_mutex);
-                std::cerr << "Error downloading Mod ID " << mod_id << ", File ID "
-                          << file_id << ": CURL code " << res
-                          << ", HTTP code " << http_code << std::endl;
+                std::cerr << "Error downloading Mod ID " << mod_id << ", File ID " << file_id << std::endl;
             }
             if (attempt < retries - 1) {
                 {
@@ -359,29 +307,6 @@ struct DownloadTask {
     fs::path file_path;
     int mod_id;
     int file_id;
-};
-
-template <typename T>
-class ThreadSafeQueue {
-public:
-    void push(T value) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_queue.push(std::move(value));
-    }
-
-    bool try_pop(T& value) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_queue.empty()) {
-            return false;
-        }
-        value = std::move(m_queue.front());
-        m_queue.pop();
-        return true;
-    }
-
-private:
-    std::queue<T> m_queue;
-    mutable std::mutex m_mutex;
 };
 
 void download_worker(ThreadSafeQueue<DownloadTask>& queue, std::atomic<int>& progress_counter, int total_files) {
@@ -469,7 +394,8 @@ void download_files(const std::string& game_domain, const fs::path& base_dir)
         }
     }
 
-    const int num_threads = 4;
+    // Use a dynamic number of threads based on hardware
+    const unsigned int num_threads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads;
     std::atomic<int> progress_counter(0);
     int total_files = lines.size();
@@ -479,7 +405,7 @@ void download_files(const std::string& game_domain, const fs::path& base_dir)
         std::cout << "Starting download of " << total_files << " files using " << num_threads << " concurrent workers..." << std::endl;
     }
 
-    for (int i = 0; i < num_threads; ++i) {
+    for (unsigned int i = 0; i < num_threads; ++i) {
         threads.emplace_back(download_worker, std::ref(download_queue), std::ref(progress_counter), total_files);
     }
 
@@ -488,4 +414,64 @@ void download_files(const std::string& game_domain, const fs::path& base_dir)
     }
 
     std::cout << "All downloads have been processed." << std::endl;
+}
+
+//----------------------------------------------------------------------------------
+// Backup Scraper Functions
+//----------------------------------------------------------------------------------
+
+/**
+ * Executes the Python scraper script to build a local database of downloaded mods.
+ */
+static void runPythonScraper(const AppConfig& config, const std::string& cookiePath, const std::string& outputJsonPath) {
+    if (config.executable_path.empty()) {
+        std::cerr << "Error: Application path not initialized." << std::endl;
+        return;
+    }
+
+    // Find the script relative to the executable's location
+    fs::path executable_dir = config.executable_path.parent_path();
+    fs::path script_path = executable_dir / "scripts" / "nexus_scraper.py";
+
+    // As a fallback for development, check the source tree structure
+    if (!fs::exists(script_path)) {
+        script_path = executable_dir / ".." / ".." / "scripts" / "nexus_scraper.py";
+        if (!fs::exists(script_path)) {
+             std::cerr << "Error: Scraper script 'nexus_scraper.py' not found in install or development locations." << std::endl;
+             return;
+        }
+    }
+
+    // Use the canonical path to resolve any ".." components
+    script_path = fs::canonical(script_path);
+
+    std::string command = "python3 \"" + script_path.string() + "\" \"" + cookiePath + "\" \"" + outputJsonPath + "\"";
+
+    std::cout << "Running Python scraper. This may take several minutes depending on your download history...\n";
+    std::cout << "Executing: " << command << std::endl;
+
+    int result = std::system(command.c_str());
+
+    if (result == 0) {
+        std::cout << "\nScraper finished successfully." << std::endl;
+        std::cout << "Downloaded mods database has been saved to: " << outputJsonPath << std::endl;
+    } else {
+        std::cerr << "\nError: Python scraper script failed with exit code " << result << std::endl;
+        std::cerr << "Please ensure Python 3, Selenium, and a compatible web driver (like geckodriver for Firefox) are installed and in your system's PATH." << std::endl;
+    }
+}
+
+void runNexusBackupScraper(const AppConfig& config) {
+    std::cout << "\n===== Running NexusMods Backup Scraper =====\n";
+
+    if (config.nexus_cookie_path.empty() || !fs::exists(config.nexus_cookie_path)) {
+        std::cerr << "Error: Path to NexusMods cookies file is not set or the file does not exist.\n";
+        std::cerr << "Please check the 'nexus_cookie_path' in your config file: " << config.nexus_cookie_path << std::endl;
+        return;
+    }
+
+    // Define an output path for the scraped data in the same directory as the cookies file.
+    fs::path output_path = fs::path(config.nexus_cookie_path).parent_path() / "nexusmods_downloaded.json";
+
+    runPythonScraper(config, config.nexus_cookie_path, output_path.string());
 }

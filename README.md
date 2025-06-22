@@ -33,11 +33,13 @@ Project Structure:
 
 Dependencies
 
-    C++17 or later
-    CURL
-    Used for making HTTP requests to fetch mod data from APIs.
-    nlohmann/json
-    A header-only JSON library for parsing and handling JSON responses.
+*   **C++17 Compiler**: A modern C++ compiler (like g++ or Clang).
+*   **CMake**: Version 3.16 or later.
+*   **CURL**: The library for making HTTP requests (`libcurl-dev` or similar).
+*   **Python 3**: Required for the backup NexusMods scraper.
+*   **Selenium for Python**: The Python scraper requires the `selenium` library (`pip install selenium`).
+
+The `nlohmann/json` dependency is now handled automatically by CMake.
 
 Building
 
@@ -48,17 +50,18 @@ These instructions assume a Linux environment with a working C++ compiler (e.g.,
 git clone https://github.com/YourUsername/Modular.git
 cd Modular
 
-Configure the Project with CMake:
+2. Configure the Project with CMake:
 
-cmake .
+    # Create a build directory for an out-of-source build
+    cmake -S . -B build
 
-    CMake will detect required dependencies and prepare build files.
+    CMake will download `nlohmann/json` and configure the project.
 
-Build the Project:
+3. Build the Project:
 
-    make
+    cmake --build build
 
-        This produces the executable(s) inside the bin directory (or directly in the project root depending on your CMake configuration).
+    This produces the `Modular` executable inside the `build` directory.
 
 Cross-Compiling for Windows
 
@@ -67,22 +70,16 @@ If you’re on Linux and want to build a Windows executable:
     Make sure you have MinGW-w64 installed (e.g., x86_64-w64-mingw32-g++).
     Edit CMakeLists.txt to enable cross-compiling.
     Run:
-
-    cmake -DCMAKE_TOOLCHAIN_FILE=/path/to/your/toolchain-file.cmake .
-    make
-
-    The resulting Windows executable will be placed in the bin folder (or the specified build directory).
+    
+    cmake -S . -B build-windows -DCMAKE_TOOLCHAIN_FILE=/path/to/your/toolchain-file.cmake
+    cmake --build build-windows
 
 Usage
 
-    Run the Executable
-    From inside the repository (or wherever the Modular binary is built):
+Run the executable from the build directory:
 
-./bin/Modular_Linux
+    ./build/Modular
 
-Or, if you are on Windows:
-
-    Modular_Windows.exe
 
     Menu Interface
         The application will present a simple menu where you can select different actions:
@@ -108,18 +105,4 @@ License
 
 You may include a license of your choice. For example:
 
-MIT License
-
-(Replace this section with the actual text of the license you want to use.)
-Contact
-
-For questions, issues, or suggestions, please open an issue on GitHub or reach out via your preferred contact method.
-
-Happy Modding!
-
-
-
-This project requires nlohmann-json in order to build. please download and install that from your package manager, or you can find it at the URL below.
-
-nlohmann-json: https://github.com/nlohmann/json
-
+This project is licensed under the MIT License. See the `LICENSE` file for details.

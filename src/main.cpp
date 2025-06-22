@@ -1,29 +1,24 @@
 #include "GameBanana.h"
 #include "NexusMods.h"
+#include "HTTPClient.h"
 #include "Config.h"
 #include "Rename.h"
 #include <cstdlib> // for std::getenv
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <sstream> // for std::istringstream if we parse user input
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
 
-// Define the global API_KEY declared in NexusMods.h
-std::string API_KEY = "";
-
 //--------------------------------------------------
 // Run all GameBanana steps in one sequence
 //--------------------------------------------------
 void runGameBananaSequence(const AppConfig& config)
 {
-    // 1) Initialize GameBanana
-    initialize();
-    std::cout << "GameBanana initialized.\n";
-
-    // 2) Use GameBanana user ID from config
+    // Use GameBanana user ID from config
     std::string userId = config.gb_user_id;
     if (userId.empty()) {
         std::cerr << "Error: GameBanana User ID is not set in the configuration.\n";
@@ -31,22 +26,22 @@ void runGameBananaSequence(const AppConfig& config)
     }
     std::cout << "Using GameBanana user ID from config: " << userId << "\n";
 
-    // 3) Fetch all subscribed mods
+    // Fetch all subscribed mods
     auto mods = fetchSubscribedMods(userId);
     if (mods.empty()) {
         std::cout << "No subscribed mods found for user ID: " << userId << "\n";
         return;
     }
 
-    std::cout << "Subscribed Mods:\n";
+    std::cout << "\nFound " << mods.size() << " subscribed mods.\n";
     for (const auto& mod : mods) {
-        std::cout << "Profile URL: " << mod.first << " | Mod Name: " << mod.second << "\n";
+        std::cout << "  - " << mod.second << "\n";
     }
 
-    // 4) Use base directory from config
+    // Use base directory from config
     const std::string& baseDir = config.mods_directory;
 
-    // 5) Download all detected mods
+    // Download all detected mods
     std::cout << "\nStarting download of all subscribed mods...\n";
 
     for (const auto& mod : mods) {
@@ -65,22 +60,18 @@ void runGameBananaSequence(const AppConfig& config)
     }
 
     std::cout << "\nAll subscribed mods have been downloaded to: " << baseDir << "\n";
-
-    // 6) Cleanup
-    cleanup();
-    std::cout << "GameBanana cleanup complete.\n";
 }
 
 //--------------------------------------------------
 // Helper: Run the NexusMods workflow for a single domain
 //--------------------------------------------------
-void runNexusModsForOneDomain(const std::vector<int>& trackedMods, const std::string& gameDomain, const fs::path& base_dir)
+void runNexusModsForOneDomain(const AppConfig& config, const std::vector<int>& trackedMods, const std::string& gameDomain)
 {
     // Get file IDs
-    auto fileIdsMap = get_file_ids(trackedMods, gameDomain);
+    auto fileIdsMap = get_file_ids(config, trackedMods, gameDomain);
 
     // Generate download links
-    auto downloadLinks = generate_download_links(fileIdsMap, gameDomain);
+    auto downloadLinks = generate_download_links(config, fileIdsMap, gameDomain);
     std::cout << "\nGenerated Download Links for domain '" << gameDomain << "':\n";
     for (auto& [modFilePair, url] : downloadLinks) {
         std::cout << "  ModID: " << modFilePair.first
@@ -89,11 +80,11 @@ void runNexusModsForOneDomain(const std::vector<int>& trackedMods, const std::st
     }
 
     // Save download links
-    save_download_links(downloadLinks, gameDomain, base_dir);
+    save_download_links(downloadLinks, gameDomain, config.mods_directory);
     std::cout << "Download links saved for domain '" << gameDomain << "'.\n";
 
     // Download files
-    download_files(gameDomain, base_dir);
+    download_files(gameDomain, config.mods_directory);
     std::cout << "Files downloaded for domain '" << gameDomain << "'.\n";
 }
 
@@ -102,18 +93,17 @@ void runNexusModsForOneDomain(const std::vector<int>& trackedMods, const std::st
 //--------------------------------------------------
 void runNexusModsSequence(const AppConfig& config, const std::vector<std::string>& domains)
 {
-    // 1) Get tracked mods once
-    API_KEY = config.nexus_api_key;
-    std::vector<int> trackedMods = get_tracked_mods();
-    std::cout << "Tracked Mods (IDs):\n";
+    // Get tracked mods once
+    std::vector<int> trackedMods = get_tracked_mods(config);
+    std::cout << "\nFound " << trackedMods.size() << " tracked mods.\n";
     for (int modId : trackedMods) {
         std::cout << "  " << modId << "\n";
     }
 
-    // 3) Run the pipeline for each domain
+    // Run the pipeline for each domain
     for (const auto& domain : domains) {
         std::cout << "\n===== Processing Domain: " << domain << " =====\n";
-        runNexusModsForOneDomain(trackedMods, domain, config.mods_directory);
+        runNexusModsForOneDomain(config, trackedMods, domain);
     }
 }
 
@@ -143,7 +133,7 @@ void runRenameSequence(const AppConfig& config)
 
         for (const auto& modID : modIDs) {
             std::cout << "\nFetching mod name for modID: " << modID << "\n";
-            std::string jsonResponse = fetchModName(gameDomain, modID);
+            std::string jsonResponse = fetchModName(config, gameDomain, modID);
             std::cout << "JSON response: " << jsonResponse << "\n";
 
             std::string rawModName = extractModName(jsonResponse);
@@ -168,23 +158,24 @@ void runRenameSequence(const AppConfig& config)
 }
 
 //--------------------------------------------------
-// Main
+// Command-line Interface Logic
 //--------------------------------------------------
-int main(int argc, char* argv[])
-{
-    AppConfig config = initialize_app();
-    API_KEY = config.nexus_api_key; // Set global API key for modules that use it
+void show_menu() {
+    std::cout << "\n---------------------------------------\n";
+    std::cout << "\n============== Main Menu ==============\n";
+    std::cout << "1. Run GameBanana Sequence\n";
+    std::cout << "2. Run NexusMods Sequence\n";
+    std::cout << "3. Run Rename Sequence (for NexusMods downloads)\n";
+    std::cout << "4. Run NexusMods Backup Scraper\n";
+    std::cout << "0. Exit\n";
+    std::cout << "=======================================\n";
+    std::cout << "Enter your choice: ";
+}
 
+int run_interactive_mode(const AppConfig& config) {
     bool running = true;
     while (running) {
-        std::cout << "\n---------------------------------------\n";
-        std::cout << "\n============== Main Menu ==============\n";
-        std::cout << "1. Run GameBanana Sequence\n";
-        std::cout << "2. Run NexusMods Sequence\n";
-        std::cout << "3. Run Rename Sequence - Typically only required after running NexusMods Sequence\n";
-        std::cout << "0. Exit\n";
-        std::cout << "=======================================\n";
-        std::cout << "Enter your choice (0/1/2/3): ";
+        show_menu();
 
         int choice;
         std::cin >> choice;
@@ -192,78 +183,119 @@ int main(int argc, char* argv[])
         // Handle invalid input
         if (!std::cin) {
             std::cin.clear();
-            std::cin.ignore(10000, '\n');
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
             std::cout << "Invalid input, please try again.\n";
             continue;
         }
 
+        // Consume the rest of the line to prevent issues with subsequent `getline` calls.
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
         switch (choice) {
-        case 0: {
+        case 0:
             running = false;
             break;
-        }
-        case 1: {
-            // Run everything for GameBanana
+        case 1:
             runGameBananaSequence(config);
             break;
-        }
         case 2: {
-            // Gather any additional domains from argv (if provided)
-            // e.g., if user ran: ./MyProgram horizonzerodawn finalfantasyxx2hdremaster
-            // then parse them now.
             std::vector<std::string> gameDomains;
+            std::cout << "Enter one or more game domains (space-separated), then press ENTER:\n> ";
+            std::string domainsLine;
+            std::getline(std::cin, domainsLine);
 
-            // Check if there are extra arguments after the "2" in argv
-            // The first argument in argv is the executable name
-            // The second argument might have been "2"
-            // So we start scanning after that
-            // e.g.  ./MyProgram 2 horizonzerodawn finalfantasyxx2hdremaster
-            //       argv[0] = "./MyProgram"
-            //       argv[1] = "2"
-            //       argv[2] = "horizonzerodawn"
-            //       argv[3] = "finalfantasyxx2hdremaster"
-            // => we start from i=2
-            for (int i = 2; i < argc; i++) {
-                gameDomains.push_back(argv[i]);
+            std::istringstream iss(domainsLine);
+            std::string domain;
+            while (iss >> domain) {
+                gameDomains.push_back(domain);
             }
 
-            // If none were provided in argv, prompt user for one or more domains
-            if (gameDomains.empty()) {
-                std::cout << "Enter one or more game domains (space-separated), then press ENTER:\n";
-                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-                std::string domainsLine;
-                std::getline(std::cin, domainsLine);
-
-                std::istringstream iss(domainsLine);
-                std::string domain;
-                while (iss >> domain) {
-                    gameDomains.push_back(domain);
-                }
-            }
-
-            // If the user still provided nothing, we can bail out or ask again
             if (gameDomains.empty()) {
                 std::cout << "No domains specified. Returning to main menu.\n";
                 break;
             }
-
-            // Now we have a list of domains. Pass them all to runNexusModsSequence
             runNexusModsSequence(config, gameDomains);
-
-            // Optionally, stop the loop
-            // running = false;
             break;
         }
-        case 3: {
+        case 3:
             runRenameSequence(config);
             break;
-        }
-        default: {
+        case 4:
+            runNexusBackupScraper(config);
+            break;
+        default:
             std::cout << "Invalid choice. Please try again.\n";
             break;
         }
+    }
+    return 0;
+}
+
+int run_direct_command(int argc, char* argv[], const AppConfig& config) {
+    std::string command = argv[1];
+    if (command == "gamebanana" || command == "1") {
+        runGameBananaSequence(config);
+    } else if (command == "nexus" || command == "2") {
+        if (argc < 3) {
+            std::cerr << "Error: The 'nexus' command requires at least one game domain.\n";
+            std::cerr << "Usage: " << argv[0] << " nexus <game_domain_1> [game_domain_2] ...\n";
+            return 1;
         }
+        std::vector<std::string> gameDomains;
+        for (int i = 2; i < argc; ++i) {
+            gameDomains.push_back(argv[i]);
+        }
+        runNexusModsSequence(config, gameDomains);
+    } else if (command == "rename" || command == "3") {
+        runRenameSequence(config);
+    } else if (command == "scraper" || command == "4") {
+        runNexusBackupScraper(config);
+    } else {
+        std::cerr << "Unknown command: " << command << "\n";
+        std::cerr << "Available commands: gamebanana, nexus, rename, scraper\n";
+        return 1;
+    }
+    return 0;
+}
+
+//--------------------------------------------------
+// Main
+//--------------------------------------------------
+int main(int argc, char* argv[])
+{
+    HTTPClient::initialize(); // Initialize global resources once.
+    int exit_code = 0;
+
+    try {
+        // Determine executable path for script finding
+        fs::path executable_path;
+        std::error_code ec;
+        executable_path = fs::canonical(argv[0], ec);
+        if (ec) {
+            std::cerr << "Warning: Could not determine canonical path for executable. Using provided path. Error: " << ec.message() << std::endl;
+            executable_path = argv[0];
+        }
+
+        // Initialize configuration
+        auto config_opt = initialize_app(executable_path);
+        if (!config_opt) {
+            throw std::runtime_error("Failed to initialize configuration. Exiting.");
+        }
+        AppConfig config = *config_opt;
+
+        if (argc > 1) {
+            // Direct command mode
+            exit_code = run_direct_command(argc, argv, config);
+        } else {
+            // Interactive menu mode
+            exit_code = run_interactive_mode(config);
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "An unhandled exception occurred: " << e.what() << std::endl;
+        exit_code = 1;
     }
 
-    return 0;
+    HTTPClient::cleanup(); // Cleanup global resources before exiting.
+    return exit_code;
 }
