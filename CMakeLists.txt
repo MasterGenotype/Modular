@@ -34,10 +34,12 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 # Define the executable target from your source files.
 add_executable(Modular
+    src/Config.cpp
     src/main.cpp
     src/NexusMods.cpp
     src/GameBanana.cpp
     src/Rename.cpp
+    src/HTTPClient.cpp
 )
 
 # Add the 'include' directory to the target's include paths.
